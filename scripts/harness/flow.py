@@ -281,7 +281,10 @@ def _run_opencode(prompt: str) -> str:
     stderr_text = proc.stderr.read() if proc.stderr else ""
     output = "".join(text_parts)
     if not output.strip():
-        log(f"opencode produced no output; stderr: {stderr_text[-1000:]}")
+        die(
+            "opencode produced no output "
+            f"(exit={proc.returncode}); stderr: {stderr_text[-1000:] or '<empty>'}"
+        )
     return output
 
 

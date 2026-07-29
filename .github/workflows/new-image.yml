@@ -104,7 +104,10 @@ jobs:
 
       - name: Install opencode
         if: steps.params.outputs.demo_mode != 'true'
-        run: npm install -g opencode-ai
+        run: |
+          npm install -g opencode-ai
+          which opencode
+          opencode --version
 
       - name: Generate image and tests
         env:
