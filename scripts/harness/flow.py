@@ -15,6 +15,7 @@ Environment:
     OPENCODE_MODEL         - (default deepseek/deepseek-v4-pro)
 """
 
+import argparse
 import html
 import json
 import os
