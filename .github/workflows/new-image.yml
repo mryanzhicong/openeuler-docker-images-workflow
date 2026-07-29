@@ -164,6 +164,8 @@ jobs:
 
       - name: Build and test
         run: |
+          echo "Holding ${{ matrix.arch.name }} runner for concurrency test"
+          sleep 300
           python3 scripts/harness/flow.py \
             --phase build-test \
             --app "${{ needs.generate.outputs.package }}" \
