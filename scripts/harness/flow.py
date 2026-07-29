@@ -15,12 +15,14 @@ Environment:
     OPENCODE_MODEL         - (default deepseek/deepseek-v4-pro)
 """
 
+import html
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.parse
 import urllib.request
@@ -37,6 +39,8 @@ AGENTS_DIR = PROJECT_ROOT / ".github" / "agents"
 WORKSPACE = Path(os.environ.get("RUNNER_TEMP", "/tmp"))
 TARGET_DIR = WORKSPACE / "target-repo"
 WORKFLOW_DIR = PROJECT_ROOT
+DEFAULT_GENERATED_ARTIFACT_DIR = WORKSPACE / "generated-new-image"
+DEFAULT_BUILD_RESULT_DIR = WORKSPACE / "new-image-build-result"
 
 MAX_RETRIES = 3
 MAX_QA_ROUNDS = 2
@@ -53,6 +57,11 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+def require_gitcode_token() -> None:
+    if not GITCODE_TOKEN:
+        die("GITCODE_TOKEN not set")
+
+
 def sh(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     log(f"$ {' '.join(cmd)}")
     return subprocess.run(cmd, **kwargs)
@@ -64,6 +73,143 @@ def check_output(cmd: list[str], **kwargs) -> str:
     if r.returncode != 0:
         print(f"  stderr: {r.stderr[-500:]}")
     return r.stdout
+
+
+def _changed_paths() -> list[str]:
+    """Return tracked modifications and untracked generated files."""
+    result = subprocess.run(
+        ["git", "-C", str(TARGET_DIR), "ls-files", "-m", "-o", "--exclude-standard", "-z"],
+        capture_output=True,
+        check=True,
+    )
+    return sorted(path.decode() for path in result.stdout.split(b"\0") if path)
+
+
+def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
+    dest_root = dest.resolve()
+    for member in tar.getmembers():
+        target = (dest / member.name).resolve(strict=False)
+        if os.path.commonpath([str(dest_root), str(target)]) != str(dest_root):
+            die(f"Artifact contains unsafe path: {member.name}")
+    tar.extractall(dest)
+
+
+def export_generated_artifact(artifact_dir: Path, app: str, version: str, os_ver: str, domain: str) -> None:
+    paths = _changed_paths()
+    if not paths:
+        app_dir = TARGET_DIR / domain / app
+        if not app_dir.exists():
+            die("No generated changes found in target repo")
+        paths = sorted(
+            str(p.relative_to(TARGET_DIR))
+            for p in app_dir.rglob("*")
+            if p.is_file()
+        )
+        log("No diff detected; exporting existing app tree for build reuse")
+
+    if artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = artifact_dir / "target-files.tar"
+    with tarfile.open(payload, "w") as tar:
+        for rel in paths:
+            src = TARGET_DIR / rel
+            if src.exists():
+                tar.add(src, arcname=rel)
+
+    manifest = {
+        "app": app,
+        "version": version,
+        "os_version": os_ver,
+        "domain": domain,
+        "paths": paths,
+    }
+    (artifact_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2)
+    )
+    log(f"Generated artifact exported to {artifact_dir} ({len(paths)} paths)")
+
+
+def apply_generated_artifact(artifact_dir: Path) -> None:
+    payload = artifact_dir / "target-files.tar"
+    if not payload.exists():
+        die(f"Generated artifact payload not found: {payload}")
+    TARGET_DIR.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(payload, "r") as tar:
+        _safe_extract(tar, TARGET_DIR)
+    log(f"Generated artifact applied from {artifact_dir}")
+
+
+def _copy_log(src: Path) -> None:
+    for dest in {WORKSPACE / src.name, Path("/tmp") / src.name}:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+
+
+def export_build_artifact(result_dir: Path, arch: str, attempt: int) -> None:
+    if result_dir.exists():
+        shutil.rmtree(result_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    for name in (f"build-{arch}.log", f"build-r{attempt}-{arch}.log"):
+        for src in (WORKSPACE / name, Path("/tmp") / name):
+            if src.exists():
+                shutil.copy2(src, result_dir / name)
+                break
+
+    for junit in TARGET_DIR.glob(f"**/results/**/{arch}.junit.xml"):
+        dest = result_dir / "target-repo" / junit.relative_to(TARGET_DIR)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(junit, dest)
+
+    log(f"Build artifact exported to {result_dir}")
+
+
+def import_build_artifacts(result_dir: Path) -> None:
+    if not result_dir.exists():
+        log(f"No build result directory found at {result_dir}; skipping import")
+        return
+
+    for log_file in result_dir.rglob("build*.log"):
+        _copy_log(log_file)
+
+    for junit in result_dir.rglob("*.junit.xml"):
+        parts = list(junit.parts)
+        if "target-repo" not in parts:
+            continue
+        idx = parts.index("target-repo")
+        rel = Path(*parts[idx + 1:])
+        dest = TARGET_DIR / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(junit, dest)
+
+    log(f"Build artifacts imported from {result_dir}")
+
+
+def validate_generated_meta() -> None:
+    env = os.environ.copy()
+    env["TARGET_REPO_DIR"] = str(TARGET_DIR)
+    result = sh(
+        [sys.executable, str(PROJECT_ROOT / "scripts" / "harness" / "validate_meta.py")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        die("Generated meta.yml validation failed")
+
+
+def is_commit_candidate(rel_path: str) -> bool:
+    path = Path(rel_path)
+    if path.name in {"ai-result.json", "test-ai-result.json", "test.sh"}:
+        return False
+    if path.name.startswith("qa-review-") and path.suffix == ".json":
+        return False
+    if "results" in path.parts or "tests" in path.parts:
+        return False
+    return True
 
 
 # ── step 1: clone target repo ──────────────────────────────────────────────
@@ -159,6 +305,7 @@ def _adversarial_pair(role: str, app: str, version: str, os_ver: str, domain: st
         return
 
     os_tag = "oe" + os_ver.lower().replace(".", "").replace("-", "")
+    source_repo = os.environ.get("SOURCE", "")
     creator_md = _load_agent(f"{role}-creator")
     qa_md = _load_agent(f"{role}-qa")
 
@@ -169,7 +316,7 @@ def _adversarial_pair(role: str, app: str, version: str, os_ver: str, domain: st
         f"Create functional test cases for {app} {version}.\n"
     )
     inst += (
-        f"Parameters: package_name={app}, os_version={os_ver}, os_tag={os_tag}, "
+        f"Parameters: package_name={app}, source_repo_url={source_repo}, os_version={os_ver}, os_tag={os_tag}, "
         f"app_version={version}, category={domain}, image_repo_dir={TARGET_DIR}\n\n"
         f"Place files under {TARGET_DIR}/{domain}/{app}/."
     )
@@ -393,7 +540,24 @@ upstream:
 
 
 # ── step 3: build + test ───────────────────────────────────────────────────
-def build_image(app: str, version: str, os_ver: str, platform: str) -> bool:
+def _write_junit(app: str, version: str, os_ver: str, domain: str, arch: str, *, tests: int, failures: int, output: str = "", message: str = "") -> None:
+    results_dir = TARGET_DIR / domain / app / "results" / version / os_ver
+    results_dir.mkdir(parents=True, exist_ok=True)
+    failure_block = ""
+    if failures:
+        failure_block = f'<failure message="{html.escape(message)}">{html.escape(output)}</failure>'
+    results_dir.joinpath(f"{arch}.junit.xml").write_text(
+        f'<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<testsuite name="{html.escape(app)}" tests="{tests}" failures="{failures}" errors="0">\n'
+        f'  <testcase name="{html.escape(app)}_test">\n'
+        f'    {failure_block}\n'
+        f'    <system-out>{html.escape(output)}</system-out>\n'
+        f'  </testcase>\n'
+        f'</testsuite>\n'
+    )
+
+
+def build_image(app: str, version: str, os_ver: str, platform: str, *, attempt: int = 1) -> bool:
     """Build Docker image; return True on success."""
     # Find Dockerfile
     r = subprocess.run(
@@ -416,7 +580,13 @@ def build_image(app: str, version: str, os_ver: str, platform: str) -> bool:
     ], capture_output=True, text=True, timeout=1800)
 
     # Save build log
-    (WORKSPACE / f"build-{arch}.log").write_text(r.stdout + r.stderr)
+    log_text = r.stdout + r.stderr
+    for path in {
+        WORKSPACE / f"build-{arch}.log",
+        WORKSPACE / f"build-r{attempt}-{arch}.log",
+        Path("/tmp") / f"build-r{attempt}-{arch}.log",
+    }:
+        path.write_text(log_text)
 
     if r.returncode != 0:
         log(f"Build FAILED for {app} ({platform})")
@@ -426,7 +596,7 @@ def build_image(app: str, version: str, os_ver: str, platform: str) -> bool:
     return True
 
 
-def test_image(app: str, platform: str) -> bool:
+def test_image(app: str, platform: str, *, version: str, os_ver: str, domain: str) -> bool:
     """Run test.sh (NOT dgoss). Returns True on pass."""
     arch = platform.split("/")[-1]
     container_name = f"{app}-test"
@@ -441,6 +611,7 @@ def test_image(app: str, platform: str) -> bool:
 
     if not test_sh:
         log(f"No test.sh found for {app}; skipping tests")
+        _write_junit(app, version, os_ver, domain, arch, tests=0, failures=0, output="skipped")
         return True  # no test = not a failure
 
     log(f"Running test.sh for {app} ({platform})")
@@ -449,6 +620,7 @@ def test_image(app: str, platform: str) -> bool:
            capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         log(f"docker run failed: {r.stderr}")
+        _write_junit(app, version, os_ver, domain, arch, tests=1, failures=1, output=r.stderr, message="docker run failed")
         return False
 
     env = os.environ.copy()
@@ -463,16 +635,20 @@ def test_image(app: str, platform: str) -> bool:
 
     if r.returncode != 0:
         log(f"Tests FAILED for {app} ({platform})")
+        _write_junit(app, version, os_ver, domain, arch, tests=1, failures=1, output=r.stdout + r.stderr, message="test.sh failed")
         return False
     log(f"Tests PASSED for {app} ({platform})")
+    _write_junit(app, version, os_ver, domain, arch, tests=1, failures=0, output=r.stdout + r.stderr)
     return True
 
 
-def run_platform(app: str, version: str, os_ver: str, platform: str) -> bool:
+def run_platform(app: str, version: str, os_ver: str, domain: str, platform: str, *, attempt: int = 1) -> bool:
     """Build and test for one platform. Return True on success."""
-    if not build_image(app, version, os_ver, platform):
+    if not build_image(app, version, os_ver, platform, attempt=attempt):
+        arch = platform.split("/")[-1]
+        _write_junit(app, version, os_ver, domain, arch, tests=0, failures=0, output="build failed")
         return False
-    return test_image(app, platform)
+    return test_image(app, platform, version=version, os_ver=os_ver, domain=domain)
 
 
 # ── step 4: fix ────────────────────────────────────────────────────────────
@@ -522,16 +698,7 @@ def compose_pr(app: str, version: str, os_ver: str, domain: str) -> None:
 
     body = [f"## Automated PR: {app} {version} on {os_ver}\n"]
     body.append("### Changes\n")
-    # List files created (from ai-result.json, since nothing committed yet)
-    files_created: list[str] = []
-    for p in TARGET_DIR.rglob("ai-result.json"):
-        try:
-            data = json.loads(p.read_text())
-            files_created = data.get("files_created", [])
-            if files_created:
-                break
-        except json.JSONDecodeError:
-            continue
+    files_created = [p for p in _changed_paths() if is_commit_candidate(p)]
     if files_created:
         body.append("```\n" + "\n".join(files_created) + "\n```\n")
     else:
@@ -623,24 +790,12 @@ def push_and_create_pr(app: str, version: str) -> None:
     branch = f"auto/{app}-{version}-{int(time.time())}"
     sh(["git", "-C", str(TARGET_DIR), "checkout", "-b", branch], capture_output=True)
 
-    # Only add standard files matching reference structure (no test.sh, no ai-result.json)
-    # Read committed file list from ai-result.json
-    committed: list[str] = []
-    for p in TARGET_DIR.rglob("ai-result.json"):
-        try:
-            data = json.loads(p.read_text())
-            committed = data.get("files_created", [])
-            if committed:
-                break
-        except json.JSONDecodeError:
-            continue
-    if committed:
-        for f in committed:
-            sh(["git", "-C", str(TARGET_DIR), "add", f], capture_output=True)
-    else:
-        # Fallback: add standard paths, exclude test/ai artifacts
-        sh(["git", "-C", str(TARGET_DIR), "add", "."], capture_output=True)
-        sh(["git", "-C", str(TARGET_DIR), "reset", "--", "*/test.sh", "*/ai-result.json", "*/tests/", "*/goss*"], capture_output=True)
+    committed = [p for p in _changed_paths() if is_commit_candidate(p)]
+    if not committed:
+        log("No committable generated files found; skipping PR creation")
+        return
+    for f in committed:
+        sh(["git", "-C", str(TARGET_DIR), "add", f], capture_output=True)
 
     r = sh(["git", "-C", str(TARGET_DIR), "diff", "--cached", "--stat"], capture_output=True, text=True)
     log(f"Files to commit:\n{r.stdout}")
@@ -665,7 +820,7 @@ def push_and_create_pr(app: str, version: str) -> None:
 def create_failure_issue(app: str, version: str, os_ver: str) -> None:
     title = f"[new-image] Needs human review: {app} {version}"
     body = [f"# Build/Test Failure Report\n"]
-    body.append(f"\n{app} {version} on {os_ver} failed after {MAX_RETRIES} retry rounds.\n")
+    body.append(f"\n{app} {version} on {os_ver} failed in the build/test pipeline.\n")
     for log_file in sorted(WORKSPACE.glob("build-*.log")):
         content = log_file.read_text()
         if "ERROR" in content or "FAILED" in content:
@@ -679,26 +834,105 @@ def create_failure_issue(app: str, version: str, os_ver: str) -> None:
     log(f"Issue created: {result.get('html_url', '(unknown)')}")
 
 
+def _set_request_env(args: argparse.Namespace) -> None:
+    os.environ["PACKAGE"] = args.app
+    os.environ["APP_VERSION"] = args.version
+    os.environ["OS_VERSION"] = args.os
+    os.environ["DOMAIN"] = args.domain
+    os.environ["SOURCE"] = args.source
+    os.environ["TARGET_REPO_DIR"] = str(TARGET_DIR)
+
+
+def phase_generate(args: argparse.Namespace) -> None:
+    require_gitcode_token()
+
+    log("=== Step 1: Clone target repo ===")
+    clone_target()
+
+    log("=== Step 2: Generate ===")
+    _adversarial_pair("image", args.app, args.version, args.os, args.domain, args.demo)
+    _adversarial_pair("testcase", args.app, args.version, args.os, args.domain, args.demo)
+    validate_generated_meta()
+    export_generated_artifact(Path(args.artifact_dir), args.app, args.version, args.os, args.domain)
+
+
+def phase_build_test(args: argparse.Namespace) -> None:
+    if not args.platform:
+        die("--platform is required for --phase build-test")
+
+    if TARGET_DIR.exists():
+        shutil.rmtree(TARGET_DIR)
+    TARGET_DIR.mkdir(parents=True, exist_ok=True)
+    apply_generated_artifact(Path(args.artifact_dir))
+
+    ok = run_platform(
+        args.app,
+        args.version,
+        args.os,
+        args.domain,
+        args.platform,
+        attempt=args.attempt,
+    )
+    arch = args.platform.split("/")[-1]
+    export_build_artifact(Path(args.results_dir), arch, args.attempt)
+    if not ok:
+        sys.exit(1)
+
+
+def phase_publish(args: argparse.Namespace) -> None:
+    require_gitcode_token()
+
+    clone_target()
+    apply_generated_artifact(Path(args.artifact_dir))
+    import_build_artifacts(Path(args.results_dir))
+    validate_generated_meta()
+    compose_pr(args.app, args.version, args.os, args.domain)
+    push_and_create_pr(args.app, args.version)
+
+
+def phase_failure_report(args: argparse.Namespace) -> None:
+    require_gitcode_token()
+    import_build_artifacts(Path(args.results_dir))
+    create_failure_issue(args.app, args.version, args.os)
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 def main() -> None:
-    import argparse
     parser = argparse.ArgumentParser(description="openEuler Docker image orchestrator")
+    parser.add_argument(
+        "--phase",
+        choices=["all", "generate", "build-test", "publish", "failure-report"],
+        default="all",
+        help="Run only one workflow phase",
+    )
     parser.add_argument("--app", required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--os", required=True)
     parser.add_argument("--domain", default="Cloud")
     parser.add_argument("--demo", action="store_true", help="Skip LLM agents, use demo files")
     parser.add_argument("--source", default="", help="Upstream source URL")
+    parser.add_argument("--platform", default="", help="Platform for build-test phase, e.g. linux/amd64")
+    parser.add_argument("--attempt", type=int, default=1, help="Build attempt number for log naming")
+    parser.add_argument("--artifact-dir", default=str(DEFAULT_GENERATED_ARTIFACT_DIR))
+    parser.add_argument("--results-dir", default=str(DEFAULT_BUILD_RESULT_DIR))
     args = parser.parse_args()
 
-    os.environ["PACKAGE"] = args.app
-    os.environ["APP_VERSION"] = args.version
-    os.environ["OS_VERSION"] = args.os
-    os.environ["DOMAIN"] = args.domain
-    os.environ["TARGET_REPO_DIR"] = str(TARGET_DIR)
+    _set_request_env(args)
 
-    if not GITCODE_TOKEN:
-        die("GITCODE_TOKEN not set")
+    if args.phase == "generate":
+        phase_generate(args)
+        return
+    if args.phase == "build-test":
+        phase_build_test(args)
+        return
+    if args.phase == "publish":
+        phase_publish(args)
+        return
+    if args.phase == "failure-report":
+        phase_failure_report(args)
+        return
+
+    require_gitcode_token()
 
     # ── Step 1: Clone ──
     log("=== Step 1: Clone target repo ===")
@@ -708,6 +942,7 @@ def main() -> None:
     log("=== Step 2: Generate ===")
     _adversarial_pair("image", args.app, args.version, args.os, args.domain, args.demo)
     _adversarial_pair("testcase", args.app, args.version, args.os, args.domain, args.demo)
+    validate_generated_meta()
 
     # ── Step 3-4: Build + Test with retry loop ──
     log("=== Step 3: Build + Test (retry loop) ===")
@@ -722,30 +957,18 @@ def main() -> None:
             arch = plat.split("/")[-1]
 
             # Build
-            ok = build_image(args.app, args.version, args.os, plat)
+            ok = build_image(args.app, args.version, args.os, plat, attempt=attempt)
             if not ok:
                 all_ok = False
                 last_results[arch] = False
-                # Record skipped test
-                results_dir = TARGET_DIR / args.domain / args.app / "results" / args.version / args.os
-                results_dir.mkdir(parents=True, exist_ok=True)
-                (results_dir / f"{arch}.junit.xml").write_text(
-                    f'<?xml version="1.0"?><testsuite name="{args.app}" tests="0" failures="0"/>'
-                )
+                _write_junit(args.app, args.version, args.os, args.domain, arch, tests=0, failures=0, output="build failed")
                 continue
 
             # Test
-            ok = test_image(args.app, plat)
+            ok = test_image(args.app, plat, version=args.version, os_ver=args.os, domain=args.domain)
             if not ok:
                 all_ok = False
                 last_results[arch] = False
-                # Record failure
-                results_dir = TARGET_DIR / args.domain / args.app / "results" / args.version / args.os
-                results_dir.mkdir(parents=True, exist_ok=True)
-                (results_dir / f"{arch}.junit.xml").write_text(
-                    f'<?xml version="1.0"?><testsuite name="{args.app}" tests="1" failures="1">'
-                    f'<testcase name="test_sh"><failure message="test.sh failed"/></testcase></testsuite>'
-                )
             else:
                 last_results[arch] = True
 

@@ -37,30 +37,196 @@ env:
   TARGET_REPO_HOST: gitcode.com
 
 jobs:
-  run:
+  generate:
+    name: Generate image files
     runs-on: ubuntu-latest
     if: |
-      contains(github.event.issue.labels.*.name, 'new-image') ||
-      github.event_name == 'workflow_dispatch'
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'new-image'))
+    outputs:
+      package: ${{ steps.params.outputs.package }}
+      source: ${{ steps.params.outputs.source }}
+      domain: ${{ steps.params.outputs.domain }}
+      os_version: ${{ steps.params.outputs.os_version }}
+      app_version: ${{ steps.params.outputs.app_version }}
+      demo_mode: ${{ steps.params.outputs.demo_mode }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup QEMU (arm64)
-        uses: docker/setup-qemu-action@v3
-      - name: Setup buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Resolve request
+        id: params
+        shell: bash
+        env:
+          DISPATCH_PACKAGE: ${{ inputs.package }}
+          DISPATCH_SOURCE: ${{ inputs.source }}
+          DISPATCH_DOMAIN: ${{ inputs.domain }}
+          DISPATCH_OS_VERSION: ${{ inputs.os_version }}
+          DISPATCH_APP_VERSION: ${{ inputs.app_version }}
+          DISPATCH_DEMO_MODE: ${{ inputs.demo_mode }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            {
+              echo "package=$DISPATCH_PACKAGE"
+              echo "source=$DISPATCH_SOURCE"
+              echo "domain=$DISPATCH_DOMAIN"
+              echo "os_version=$DISPATCH_OS_VERSION"
+              echo "app_version=$DISPATCH_APP_VERSION"
+              echo "demo_mode=$DISPATCH_DEMO_MODE"
+            } >> "$GITHUB_OUTPUT"
+          else
+            package=""
+            source=""
+            domain=""
+            os_version=""
+            app_version="1.27.2"
 
-      - name: Run flow
-        id: flow
+            while IFS='=' read -r key value; do
+              case "$key" in
+                package_name) package="$value" ;;
+                source_repo_url) source="$value" ;;
+                domain) domain="$value" ;;
+                os_version) os_version="$value" ;;
+                app_version) app_version="$value" ;;
+              esac
+            done < <(python3 scripts/harness/parse_issue.py)
+
+            app_version="${app_version:-1.27.2}"
+            {
+              echo "package=$package"
+              echo "source=$source"
+              echo "domain=$domain"
+              echo "os_version=$os_version"
+              echo "app_version=$app_version"
+              echo "demo_mode=false"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install opencode
+        if: steps.params.outputs.demo_mode != 'true'
+        run: npm install -g opencode-ai
+
+      - name: Generate image and tests
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          ANTHROPIC_BASE_URL: https://api.deepseek.com/anthropic
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          DEMO_FLAG=""
+          if [ "${{ steps.params.outputs.demo_mode }}" = "true" ]; then
+            DEMO_FLAG="--demo"
+          fi
+          python3 scripts/harness/flow.py \
+            --phase generate \
+            --app "${{ steps.params.outputs.package }}" \
+            --version "${{ steps.params.outputs.app_version }}" \
+            --os "${{ steps.params.outputs.os_version }}" \
+            --domain "${{ steps.params.outputs.domain }}" \
+            --source "${{ steps.params.outputs.source }}" \
+            --artifact-dir "$RUNNER_TEMP/generated-new-image" \
+            $DEMO_FLAG
+
+      - name: Upload generated artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-new-image
+          path: ${{ runner.temp }}/generated-new-image/
+          if-no-files-found: error
+
+  build-and-test:
+    name: Build and test (${{ matrix.arch.name }})
+    needs: generate
+    strategy:
+      fail-fast: false
+      # One new-image task starts one native build per architecture.
+      # Across workflow runs, the two X64 and two ARM64 runners cap per-arch task concurrency.
+      max-parallel: 2
+      matrix:
+        arch:
+          - name: amd64
+            platform: linux/amd64
+            runner: [self-hosted, Linux, X64, docker]
+          - name: arm64
+            platform: linux/arm64
+            runner: [self-hosted, Linux, ARM64, docker]
+    runs-on: ${{ matrix.arch.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download generated artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-new-image
+          path: ${{ runner.temp }}/generated-new-image
+
+      - name: Build and test
+        run: |
+          python3 scripts/harness/flow.py \
+            --phase build-test \
+            --app "${{ needs.generate.outputs.package }}" \
+            --version "${{ needs.generate.outputs.app_version }}" \
+            --os "${{ needs.generate.outputs.os_version }}" \
+            --domain "${{ needs.generate.outputs.domain }}" \
+            --source "${{ needs.generate.outputs.source }}" \
+            --platform "${{ matrix.arch.platform }}" \
+            --attempt 1 \
+            --artifact-dir "$RUNNER_TEMP/generated-new-image" \
+            --results-dir "$RUNNER_TEMP/new-image-build-${{ matrix.arch.name }}"
+
+      - name: Upload build results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-image-build-${{ matrix.arch.name }}
+          path: ${{ runner.temp }}/new-image-build-${{ matrix.arch.name }}/
+          if-no-files-found: warn
+
+      - name: Cleanup build environment
+        if: always()
+        run: |
+          set +e
+          docker rm -f "${{ needs.generate.outputs.package }}-test" >/dev/null 2>&1 || true
+          docker image rm -f "openeuler/${{ needs.generate.outputs.package }}:test" >/dev/null 2>&1 || true
+          docker buildx prune -af --keep-storage "${BUILDX_KEEP_STORAGE:-20GB}" >/dev/null 2>&1 || \
+            docker buildx prune -af --filter "until=24h" >/dev/null 2>&1 || true
+          rm -rf "$RUNNER_TEMP/target-repo" \
+                 "$RUNNER_TEMP/generated-new-image" \
+                 "$RUNNER_TEMP/new-image-build-${{ matrix.arch.name }}"
+
+  publish:
+    name: Publish PR
+    needs: [generate, build-and-test]
+    if: ${{ needs.build-and-test.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download generated artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-new-image
+          path: ${{ runner.temp }}/generated-new-image
+
+      - name: Download build results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: new-image-build-*
+          path: ${{ runner.temp }}/new-image-results
+          merge-multiple: true
+
+      - name: Create PR
         env:
           GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
         run: |
-          python scripts/harness/flow.py \
-            --app "${{ inputs.package || github.event.issue.body.package }}" \
-            --version "${{ inputs.app_version || '1.27.2' }}" \
-            --os "${{ inputs.os_version || '24.03-lts' }}" \
-            --domain "${{ inputs.domain || 'Cloud' }}" \
-            ${{ inputs.demo_mode == true && '--demo' || '' }}
+          python3 scripts/harness/flow.py \
+            --phase publish \
+            --app "${{ needs.generate.outputs.package }}" \
+            --version "${{ needs.generate.outputs.app_version }}" \
+            --os "${{ needs.generate.outputs.os_version }}" \
+            --domain "${{ needs.generate.outputs.domain }}" \
+            --source "${{ needs.generate.outputs.source }}" \
+            --artifact-dir "$RUNNER_TEMP/generated-new-image" \
+            --results-dir "$RUNNER_TEMP/new-image-results"
 
       - name: Show PR URL
         if: always()
@@ -70,3 +236,31 @@ jobs:
           else
             echo "No PR created (all attempts failed or issue filed)"
           fi
+
+  failure-report:
+    name: Create failure issue
+    needs: [generate, build-and-test]
+    if: ${{ always() && needs.generate.result == 'success' && needs.build-and-test.result == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: new-image-build-*
+          path: ${{ runner.temp }}/new-image-results
+          merge-multiple: true
+
+      - name: Create failure issue
+        env:
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+        run: |
+          python3 scripts/harness/flow.py \
+            --phase failure-report \
+            --app "${{ needs.generate.outputs.package }}" \
+            --version "${{ needs.generate.outputs.app_version }}" \
+            --os "${{ needs.generate.outputs.os_version }}" \
+            --domain "${{ needs.generate.outputs.domain }}" \
+            --source "${{ needs.generate.outputs.source }}" \
+            --results-dir "$RUNNER_TEMP/new-image-results"
