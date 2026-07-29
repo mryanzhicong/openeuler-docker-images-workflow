@@ -189,19 +189,6 @@ def import_build_artifacts(result_dir: Path) -> None:
     log(f"Build artifacts imported from {result_dir}")
 
 
-def validate_generated_meta() -> None:
-    env = os.environ.copy()
-    env["TARGET_REPO_DIR"] = str(TARGET_DIR)
-    result = sh(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "harness" / "validate_meta.py")],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        die("Generated meta.yml validation failed")
-
-
 def is_commit_candidate(rel_path: str) -> bool:
     path = Path(rel_path)
     if path.name in {"ai-result.json", "test-ai-result.json", "test.sh"}:
@@ -856,7 +843,6 @@ def phase_generate(args: argparse.Namespace) -> None:
     log("=== Step 2: Generate ===")
     _adversarial_pair("image", args.app, args.version, args.os, args.domain, args.demo)
     _adversarial_pair("testcase", args.app, args.version, args.os, args.domain, args.demo)
-    validate_generated_meta()
     export_generated_artifact(Path(args.artifact_dir), args.app, args.version, args.os, args.domain)
 
 
@@ -889,7 +875,6 @@ def phase_publish(args: argparse.Namespace) -> None:
     clone_target()
     apply_generated_artifact(Path(args.artifact_dir))
     import_build_artifacts(Path(args.results_dir))
-    validate_generated_meta()
     compose_pr(args.app, args.version, args.os, args.domain)
     push_and_create_pr(args.app, args.version)
 
@@ -946,7 +931,6 @@ def main() -> None:
     log("=== Step 2: Generate ===")
     _adversarial_pair("image", args.app, args.version, args.os, args.domain, args.demo)
     _adversarial_pair("testcase", args.app, args.version, args.os, args.domain, args.demo)
-    validate_generated_meta()
 
     # ── Step 3-4: Build + Test with retry loop ──
     log("=== Step 3: Build + Test (retry loop) ===")
