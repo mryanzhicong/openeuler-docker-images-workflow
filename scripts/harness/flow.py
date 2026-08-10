@@ -53,7 +53,6 @@ from scripts.lib.native_repair import (
 )
 from scripts.lib.native_validation import (
     NativeValidationError,
-    release_run_builders,
     validate_native_image,
     validate_native_smoke,
     write_infrastructure_failure_evidence,
@@ -554,16 +553,6 @@ def cmd_phase1_decide(args: argparse.Namespace) -> None:
     _print_json(summary)
 
 
-def cmd_phase1_native_release(args: argparse.Namespace) -> None:
-    _print_json(
-        release_run_builders(
-            run_id=args.run_id,
-            architecture=args.architecture,
-            workspace=args.workspace,
-        )
-    )
-
-
 def _add_task_commands(commands: argparse._SubParsersAction) -> None:
     task = commands.add_parser("task-spec")
     task.add_argument("--app", required=True)
@@ -805,20 +794,6 @@ def _add_native_commands(commands: argparse._SubParsersAction) -> None:
     decide.add_argument("--opencode", required=True, type=Path)
     decide.add_argument("--github-output", type=Path)
     decide.set_defaults(handler=cmd_phase1_decide)
-
-    release = commands.add_parser(
-        "phase1-native-release",
-        help="Release the builders this run owns on one architecture",
-    )
-    release.add_argument("--workspace", required=True, type=Path)
-    release.add_argument(
-        "--architecture",
-        required=True,
-        choices=("x86_64", "aarch64"),
-    )
-    release.add_argument("--run-id", required=True)
-    release.set_defaults(handler=cmd_phase1_native_release)
-
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(

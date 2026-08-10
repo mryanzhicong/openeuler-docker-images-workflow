@@ -257,6 +257,8 @@ def test_native_validation_uses_dedicated_builder_and_generated_runtime_checks(
     assert report["status"] == "passed"
     assert report["architecture"] == "x86_64"
     assert report["platform"] == "linux/amd64"
+    assert report["builder"] == "oe-e2e-123456-x86-64-builder"
+    assert report["build_cache"] == "disabled"
     assert report["image_id"] == "sha256:image-id"
     assert set(report["environment"]) == {
         "test_time",
@@ -282,6 +284,7 @@ def test_native_validation_uses_dedicated_builder_and_generated_runtime_checks(
     assert "docker buildx create" in flattened
     assert "--driver docker-container" in flattened
     assert "docker buildx build" in flattened
+    assert "--no-cache" in flattened
     assert "--platform linux/amd64" in flattened
     dgoss_call = runner.calls[
         [command[0] for command in commands].index(str(dgoss))
@@ -301,10 +304,7 @@ def test_native_validation_uses_dedicated_builder_and_generated_runtime_checks(
     assert "docker image rm" in flattened
     assert "system prune" not in flattened
     assert "setup-qemu" not in flattened
-    # The builder carries this run's layer cache, so it must survive until
-    # release_run_builders runs; --use would also leak it as the runner-wide
-    # default once it is no longer torn down here.
-    assert "docker buildx rm" not in flattened
+    assert "docker buildx rm" in flattened
     assert "--use" not in flattened
     output = capsys.readouterr().out
     markers = [
@@ -489,8 +489,7 @@ def test_native_validation_failure_still_cleans_exact_resources(tmp_path):
     )
     assert "docker image rm" in flattened
     assert "system prune" not in flattened
-    # A failed round is exactly when the next round needs the cached builder.
-    assert "docker buildx rm" not in flattened
+    assert "docker buildx rm" in flattened
 
 
 def test_native_validation_failure_keeps_both_ends_of_a_long_log(tmp_path):
@@ -716,6 +715,7 @@ def test_format_failure_is_recorded_but_native_validation_still_runs(tmp_path):
     }
     commands = "\n".join(" ".join(call["command"]) for call in runner.calls)
     assert "docker buildx build" in commands
+    assert "--no-cache" in commands
     assert str(dgoss) in commands
     assert "docker exec" in commands
 
@@ -1066,6 +1066,8 @@ def test_native_pipeline_smoke_builds_and_runs_dgoss_without_ai(
     )
 
     assert report["status"] == "passed"
+    assert report["builder"] == "oe-smoke-123456-x86-64-builder"
+    assert report["build_cache"] == "disabled"
     assert report["checks"] == {
         "native_build": True,
         "dgoss": True,
@@ -1078,7 +1080,7 @@ def test_native_pipeline_smoke_builds_and_runs_dgoss_without_ai(
     assert str(dgoss) in commands
     assert "docker image inspect" in commands
     assert "docker image rm" in commands
-    assert "docker buildx rm" not in commands
+    assert "docker buildx rm" in commands
     assert "docker exec" in commands
     dgoss_calls = [
         call for call in runner.calls if call["command"][0] == str(dgoss)
@@ -1146,7 +1148,7 @@ def test_smoke_format_failure_does_not_skip_native_plumbing(tmp_path):
     }
 
 
-def test_repeated_validation_reuses_the_run_builder_and_its_layer_cache(
+def test_repeated_validation_creates_and_removes_a_fresh_builder(
     tmp_path,
 ):
     from scripts.lib.native_validation import validate_native_image
@@ -1176,10 +1178,16 @@ def test_repeated_validation_reuses_the_run_builder_and_its_layer_cache(
     inspects = [command for command in commands if command[:3] == [
         "docker", "buildx", "inspect",
     ]]
-    # A repair round re-enters validation; recreating the builder would throw
-    # away the cached builder stage and rebuild from source every round.
-    assert len(inspects) == 2
-    assert len(creates) == 1
+    removes = [command for command in commands if command[:4] == [
+        "docker", "buildx", "rm", "--force",
+    ]]
+    builds = [command for command in commands if command[:3] == [
+        "docker", "buildx", "build",
+    ]]
+    assert inspects == []
+    assert len(creates) == 2
+    assert len(removes) == 2
+    assert all("--no-cache" in command for command in builds)
     assert creates[0][creates[0].index("--name") + 1] == (
         "oe-e2e-123456-x86-64-builder"
     )
@@ -1217,116 +1225,6 @@ def test_report_records_the_candidate_content_that_was_validated(tmp_path):
     # A Fixer edit between rounds must be visible in the recorded digest,
     # otherwise the digest cannot prove what each architecture validated.
     assert before != after
-
-
-def test_release_run_builders_frees_exactly_this_run_on_one_architecture(
-    tmp_path,
-):
-    from scripts.lib.native_validation import release_run_builders
-
-    runner = DockerRunner()
-    runner.builders.update(
-        {
-            "oe-e2e-123456-aarch64-builder",
-            "oe-smoke-123456-aarch64-builder",
-        }
-    )
-
-    report = release_run_builders(
-        run_id="123456",
-        architecture="aarch64",
-        workspace=tmp_path,
-        runner=runner,
-    )
-
-    removed = [
-        call["command"][4]
-        for call in runner.calls
-        if call["command"][:4] == ["docker", "buildx", "rm", "--force"]
-    ]
-    assert removed == [
-        "oe-e2e-123456-aarch64-builder",
-        "oe-smoke-123456-aarch64-builder",
-    ]
-    assert report["released_builders"] == removed
-    assert report["status"] == "passed"
-
-
-@pytest.mark.parametrize("failure", ["list", "remove"])
-def test_release_run_builders_reports_buildx_failures(tmp_path, failure):
-    from scripts.lib.native_validation import (
-        NativeValidationError,
-        release_run_builders,
-    )
-
-    class FailingReleaseRunner(DockerRunner):
-        def __call__(self, command, cwd, env, timeout):
-            command = list(command)
-            if failure == "list" and command[:3] == [
-                "docker",
-                "buildx",
-                "ls",
-            ]:
-                return subprocess.CompletedProcess(
-                    command, 1, "", "cannot connect to Docker daemon"
-                )
-            if failure == "remove" and command[:4] == [
-                "docker",
-                "buildx",
-                "rm",
-                "--force",
-            ]:
-                return subprocess.CompletedProcess(
-                    command, 1, "", "failed to remove builder"
-                )
-            return super().__call__(command, cwd, env, timeout)
-
-    runner = FailingReleaseRunner()
-    runner.builders.add("oe-e2e-123456-x86-64-builder")
-
-    with pytest.raises(
-        NativeValidationError,
-        match=(
-            "cannot connect to Docker daemon"
-            if failure == "list"
-            else "failed to remove builder"
-        ),
-    ):
-        release_run_builders(
-            run_id="123456",
-            architecture="x86_64",
-            workspace=tmp_path,
-            runner=runner,
-        )
-
-
-def test_release_run_builders_allows_missing_run_builders(tmp_path):
-    from scripts.lib.native_validation import release_run_builders
-
-    report = release_run_builders(
-        run_id="123456",
-        architecture="x86_64",
-        workspace=tmp_path,
-        runner=DockerRunner(),
-    )
-
-    assert report["released_builders"] == []
-
-
-@pytest.mark.parametrize("run_id", ["", "0", "abc", "12x"])
-def test_release_run_builders_rejects_an_unusable_run_id(tmp_path, run_id):
-    from scripts.lib.native_validation import (
-        NativeValidationError,
-        release_run_builders,
-    )
-
-    with pytest.raises(NativeValidationError, match="run_id"):
-        release_run_builders(
-            run_id=run_id,
-            architecture="x86_64",
-            workspace=tmp_path,
-            runner=DockerRunner(),
-        )
 
 
 @pytest.mark.parametrize("architecture", ["amd64", "arm64", "../x86_64"])

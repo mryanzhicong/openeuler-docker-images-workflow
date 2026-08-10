@@ -85,7 +85,7 @@ jobs:
           inputs.operation == 'validate_only' ||
           inputs.operation == 'existing_as_new_probe' ||
           inputs.operation == 'scenario_one' }}
-    runs-on: [self-hosted, Linux, X64, oe-image-x86]
+    runs-on: ubuntu-latest
     # Leaves headroom around the bounded Creator/QA calls for deterministic
     # gates, report writing and candidate packaging.
     timeout-minutes: 360
@@ -95,12 +95,11 @@ jobs:
       - name: Check out workflow source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Set up native runner (x86_64)
+      - name: Set up control tooling
         id: tools
         uses: ./.github/actions/phase1-setup
         with:
           arch: x86_64
-          preflight: "true"
 
       - name: Normalize TaskSpec
         env:
@@ -314,7 +313,7 @@ jobs:
   seed-resume:
     name: Seed resumed run artifacts
     if: ${{ inputs.operation == 'resume_round' }}
-    runs-on: [self-hosted, Linux, X64, oe-image-x86]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Validate resume inputs
@@ -585,7 +584,7 @@ jobs:
            inputs.operation == 'resume_package' ||
            inputs.operation == 'recover_package') }}
     needs: [round-1, round-2, round-3, round-4]
-    runs-on: [self-hosted, Linux, X64, oe-image-x86]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Validate source run ID
@@ -1053,62 +1052,6 @@ jobs:
             printf 'non-overlapping target-base advance.\n'
           } >> "${GITHUB_STEP_SUMMARY}"
 
-  release-x86-builders:
-    name: Clean Environment (x86_64)
-    # The builder now outlives each validation so repair rounds keep their
-    # layer cache, so the run has to hand it back explicitly.
-    # resume_round can start at round 2, 3 or 4, so gating on round 1 alone
-    # would strand the builders those later rounds create.
-    if: >-
-      ${{ always() &&
-          (needs.round-1.result != 'skipped' ||
-           needs.round-2.result != 'skipped' ||
-           needs.round-3.result != 'skipped' ||
-           needs.round-4.result != 'skipped') }}
-    needs: [round-1, round-2, round-3, round-4]
-    runs-on: [self-hosted, Linux, X64, oe-image-x86]
-    timeout-minutes: 15
-    steps:
-      - name: Check out workflow source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      - name: Set up tooling
-        uses: ./.github/actions/phase1-setup
-
-      - name: Clean Environment (x86_64)
-        run: |
-          "${RUNNER_TEMP}/phase1-venv/bin/python" scripts/harness/flow.py \
-            phase1-native-release \
-            --workspace "${GITHUB_WORKSPACE}" \
-            --architecture x86_64 \
-            --run-id "${{ github.run_id }}"
-
-  release-arm-builders:
-    name: Clean Environment (aarch64)
-    if: >-
-      ${{ always() &&
-          (needs.round-1.result != 'skipped' ||
-           needs.round-2.result != 'skipped' ||
-           needs.round-3.result != 'skipped' ||
-           needs.round-4.result != 'skipped') }}
-    needs: [round-1, round-2, round-3, round-4]
-    runs-on: [self-hosted, Linux, ARM64, oe-image-arm64]
-    timeout-minutes: 15
-    steps:
-      - name: Check out workflow source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-
-      - name: Set up tooling
-        uses: ./.github/actions/phase1-setup
-
-      - name: Clean Environment (aarch64)
-        run: |
-          "${RUNNER_TEMP}/phase1-venv/bin/python" scripts/harness/flow.py \
-            phase1-native-release \
-            --workspace "${GITHUB_WORKSPACE}" \
-            --architecture aarch64 \
-            --run-id "${{ github.run_id }}"
-
   deliver-fork-pr:
     name: Create fork PR from candidate
     if: >-
@@ -1118,13 +1061,8 @@ jobs:
            ((inputs.operation == 'scenario_one' ||
              inputs.operation == 'existing_as_new_probe') &&
             needs.package-candidate.result == 'success')) }}
-    # Cleanup is ordered before delivery for a complete lifecycle, but a
-    # cleanup failure must not block a PR for an already validated candidate.
-    needs:
-      - package-candidate
-      - release-x86-builders
-      - release-arm-builders
-    runs-on: [self-hosted, Linux, X64, oe-image-x86]
+    needs: [package-candidate]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
       pr_url: ${{ steps.delivery.outputs.pr_url }}
@@ -1235,8 +1173,6 @@ jobs:
       - round-3
       - round-4
       - package-candidate
-      - release-x86-builders
-      - release-arm-builders
       - deliver-fork-pr
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1308,7 +1244,7 @@ jobs:
   issue-contract-test:
     name: Test failure Issue lifecycle
     if: ${{ inputs.operation == 'failure_issue_contract_test' }}
-    runs-on: [self-hosted, Linux, X64, oe-image-x86]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check out workflow source

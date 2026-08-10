@@ -666,7 +666,6 @@ def test_pipeline_stage_commands_are_exposed():
         "phase1-native-repair",
         "phase1-native-validate",
         "phase1-infra-evidence",
-        "phase1-native-release",
         "phase1-decide",
     ):
         result = _run(command, "--help")
@@ -697,7 +696,6 @@ def test_flow_is_the_only_phase_one_entry():
         "phase1-native-repair",
         "phase1-native-validate",
         "phase1-infra-evidence",
-        "phase1-native-release",
         "phase1-decide",
     ):
         result = _run(command, "--help")

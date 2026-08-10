@@ -516,30 +516,13 @@ def validated_patch_digest(workspace: Path) -> str:
     return hashlib.sha256(completed.stdout).hexdigest()
 
 
-def _builder_name(kind: str, run_id: str, architecture: str) -> str:
-    return f"oe-{kind}-{run_id}-{architecture.replace('_', '-')}-builder"
-
-
-def _ensure_builder(
+def _create_builder(
     runner: CommandRunner,
     builder: str,
     *,
     cwd: Path,
 ) -> None:
-    """Reuse this run's builder so later rounds keep their layer cache.
-
-    The docker-container driver stores the BuildKit cache inside the builder
-    container, so creating a fresh builder per validation would discard every
-    cached layer and rebuild from source on each repair round.
-    """
-    existing = _run(
-        runner,
-        ["docker", "buildx", "inspect", builder],
-        cwd=cwd,
-        check=False,
-    )
-    if existing.returncode == 0:
-        return
+    """Create a disposable builder for exactly one native validation."""
     _run(
         runner,
         [
@@ -553,52 +536,6 @@ def _ensure_builder(
         ],
         cwd=cwd,
     )
-
-
-def release_run_builders(
-    *,
-    run_id: str,
-    architecture: str,
-    workspace: Path,
-    runner: CommandRunner = _default_runner,
-) -> dict[str, object]:
-    """Remove the builders this run owns on one architecture's runner."""
-    if architecture not in _PLATFORMS:
-        raise NativeValidationError(
-            "architecture must be the native runner name x86_64 or aarch64"
-        )
-    if not _RUN_ID_RE.fullmatch(run_id):
-        raise NativeValidationError("run_id must be a positive integer")
-    listed = _run(
-        runner,
-        ["docker", "buildx", "ls", "--format", "{{.Name}}"],
-        cwd=Path(workspace),
-        timeout=300,
-    )
-    existing = {
-        line.strip()
-        for line in str(listed.stdout or "").splitlines()
-        if line.strip()
-    }
-    released = []
-    for kind in ("e2e", "smoke"):
-        builder = _builder_name(kind, run_id, architecture)
-        if builder not in existing:
-            continue
-        _run(
-            runner,
-            ["docker", "buildx", "rm", "--force", builder],
-            cwd=Path(workspace),
-            timeout=300,
-        )
-        released.append(builder)
-    log(f"native:{architecture}", "PASS released run builders")
-    return {
-        "status": "passed",
-        "architecture": architecture,
-        "run_id": run_id,
-        "released_builders": released,
-    }
 
 
 def _validate_tool(path: Path, name: str) -> Path:
@@ -851,7 +788,7 @@ def validate_native_image(
     try:
         try:
             log(stage, "START build")
-            _ensure_builder(runner, builder, cwd=workspace)
+            _create_builder(runner, builder, cwd=workspace)
             _run(
                 runner,
                 [
@@ -860,6 +797,7 @@ def validate_native_image(
                     "build",
                     "--builder",
                     builder,
+                    "--no-cache",
                     "--load",
                     "--progress",
                     "plain",
@@ -940,13 +878,11 @@ def validate_native_image(
                 container_evidence = {"capture_error": capture_error}
                 log(stage, f"WARN container evidence: {capture_error}")
     finally:
-        # The builder outlives this call on purpose: repair rounds re-enter
-        # validation and must keep the cached builder stage. It is released
-        # once per run by release_run_builders.
         cleanup_commands = (
-            ["docker", "rm", "--force", dgoss_container],
-            ["docker", "rm", "--force", container],
+            ["docker", "rm", "--force", "--volumes", dgoss_container],
+            ["docker", "rm", "--force", "--volumes", container],
             ["docker", "image", "rm", "--force", image],
+            ["docker", "buildx", "rm", "--force", builder],
         )
         for command in cleanup_commands:
             _run(
@@ -966,6 +902,8 @@ def validate_native_image(
         "task_id": task.task_id,
         "architecture": architecture,
         "platform": platform,
+        "builder": builder,
+        "build_cache": "disabled",
         "image_id": image_id,
         "validated_patch_sha256": validated_patch_sha256,
         "duration_seconds": round(time.monotonic() - start, 3),
@@ -1099,7 +1037,7 @@ def validate_native_smoke(
     current_check = ""
     log(stage, "START native plumbing")
     try:
-        _ensure_builder(runner, builder, cwd=workspace)
+        _create_builder(runner, builder, cwd=workspace)
         current_check = "native_build"
         for mode, mode_root in contexts.items():
             _run(
@@ -1110,6 +1048,7 @@ def validate_native_smoke(
                     "build",
                     "--builder",
                     builder,
+                    "--no-cache",
                     "--load",
                     "--progress",
                     "plain",
@@ -1169,13 +1108,13 @@ def validate_native_smoke(
         if current_check:
             checks[current_check] = False
     finally:
-        # Released once per run by release_run_builders, like the e2e builder.
         cleanup = [
-            ["docker", "rm", "--force", name] for name in containers
+            ["docker", "rm", "--force", "--volumes", name]
+            for name in containers
         ] + [
             ["docker", "image", "rm", "--force", image]
             for image in images.values()
-        ]
+        ] + [["docker", "buildx", "rm", "--force", builder]]
         for command in cleanup:
             _run(
                 runner,
@@ -1192,6 +1131,8 @@ def validate_native_smoke(
         "task_id": task.task_id,
         "architecture": architecture,
         "platform": platform,
+        "builder": builder,
+        "build_cache": "disabled",
         "image_id": image_id,
         "validated_patch_sha256": validated_patch_sha256,
         "duration_seconds": round(time.monotonic() - start, 3),

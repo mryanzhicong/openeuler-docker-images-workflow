@@ -328,11 +328,7 @@ def test_scenario_one_runs_full_validation_chain_and_delivers_same_run():
 
     delivery = jobs["deliver-fork-pr"]
     delivery_text = _job_text(delivery)
-    assert delivery["needs"] == [
-        "package-candidate",
-        "release-x86-builders",
-        "release-arm-builders",
-    ]
+    assert delivery["needs"] == ["package-candidate"]
     assert "always()" in delivery["if"]
     assert "inputs.operation == 'scenario_one'" in delivery["if"]
     assert "needs.package-candidate.result == 'success'" in delivery["if"]
@@ -540,7 +536,7 @@ def test_phase1_task_defaults_are_the_confirmed_kvrocks_contract():
 
 
 
-def test_native_jobs_use_exact_self_hosted_labels_and_no_emulation_actions():
+def test_only_native_validation_uses_self_hosted_runner_pools():
     jobs = _workflow()["jobs"]
     round_jobs = _workflow(ROUND_PATH)["jobs"]
 
@@ -548,22 +544,10 @@ def test_native_jobs_use_exact_self_hosted_labels_and_no_emulation_actions():
         "prepare",
         "seed-resume",
         "package-candidate",
-        "release-x86-builders",
         "deliver-fork-pr",
         "issue-contract-test",
     ):
-        assert jobs[name]["runs-on"] == [
-            "self-hosted",
-            "Linux",
-            "X64",
-            "oe-image-x86",
-        ]
-    assert jobs["release-arm-builders"]["runs-on"] == [
-        "self-hosted",
-        "Linux",
-        "ARM64",
-        "oe-image-arm64",
-    ]
+        assert jobs[name]["runs-on"] == "ubuntu-latest"
     # Each round pins both native runners; emulation would hide the very
     # architecture differences the round exists to find.
     assert round_jobs["x86_64"]["runs-on"] == [
@@ -578,12 +562,7 @@ def test_native_jobs_use_exact_self_hosted_labels_and_no_emulation_actions():
         "ARM64",
         "oe-image-arm64",
     ]
-    assert round_jobs["decide"]["runs-on"] == [
-        "self-hosted",
-        "Linux",
-        "X64",
-        "oe-image-x86",
-    ]
+    assert round_jobs["decide"]["runs-on"] == "ubuntu-latest"
 
     for path in (WORKFLOW_PATH, ROUND_PATH):
         text = path.read_text()
@@ -1033,30 +1012,33 @@ def test_legacy_evidence_is_allowed_only_on_the_reviewed_recovery_path():
 
 
 
-def test_each_architecture_hands_its_run_builder_back_exactly_once():
+def test_each_native_job_cleans_before_and_after_without_release_jobs():
     jobs = _workflow()["jobs"]
+    round_jobs = _workflow(ROUND_PATH)["jobs"]
     workflow_text = WORKFLOW_PATH.read_text()
 
-    # Validation keeps the builder alive for later rounds, so the run is only
-    # leak-free if a release job runs even when validation failed.
-    for name, architecture, runner_label in (
-        ("release-x86-builders", "x86_64", "oe-image-x86"),
-        ("release-arm-builders", "aarch64", "oe-image-arm64"),
+    assert "release-x86-builders" not in jobs
+    assert "release-arm-builders" not in jobs
+    assert "phase1-native-release" not in workflow_text
+    for name, architecture in (
+        ("x86_64", "x86_64"),
+        ("aarch64", "aarch64"),
     ):
-        job = jobs[name]
-        text = _job_text(job)
-        assert job["needs"] == list(ROUNDS)
-        assert "always()" in job["if"]
-        assert "skipped" in job["if"]
-        assert runner_label in job["runs-on"]
-        assert "phase1-native-release" in text
-        assert f"--architecture {architecture}" in text
-        assert "github.run_id" in text
-        assert "GITCODE_TOKEN" not in text
-
-    assert workflow_text.count("phase1-native-release") == 2
-    for path in (WORKFLOW_PATH, ROUND_PATH):
-        assert "docker buildx rm" not in path.read_text()
+        job = round_jobs[name]
+        commands = "\n".join(
+            str(step.get("run", "")) for step in job["steps"]
+        )
+        assert f"--architecture {architecture}" in commands
+        assert "--job-temp" in commands
+        assert "--phase before" in commands
+        assert "--phase after" in commands
+        assert "--runner-name" in commands
+        assert "runner.name" in commands
+        after = next(
+            step for step in job["steps"]
+            if step["name"].startswith("Clean native runner after")
+        )
+        assert "always()" in after["if"]
 
 
 def test_test_duplicate_pr_skip_has_an_explicit_production_removal_marker():
@@ -1089,8 +1071,6 @@ def test_jobs_and_run_have_readable_display_names():
         "round-3": "Round 3: validate and fix",
         "round-4": "Round 4: validate and fix",
         "package-candidate": "Seal and publish final candidate",
-        "release-x86-builders": "Clean Environment (x86_64)",
-        "release-arm-builders": "Clean Environment (aarch64)",
         "deliver-fork-pr": "Create fork PR from candidate",
         "finalize-trigger-issue": "Finalize trigger Issue",
         "issue-contract-test": "Test failure Issue lifecycle",
@@ -1276,17 +1256,20 @@ def _delegated_setup_step(job):
     assert all(
         not step.get("uses", "").startswith("./") for step in steps[:checkout]
     )
-    setup = steps[checkout + 1]
+    setup = next(
+        step for step in steps[checkout + 1:]
+        if step.get("uses") == "./.github/actions/phase1-setup"
+    )
     assert setup["uses"] == "./.github/actions/phase1-setup"
     return setup
 
 
 
-def test_every_native_job_delegates_setup_and_keeps_checkout_in_the_job():
+def test_control_and_native_jobs_delegate_their_setup_modes():
     jobs = _workflow()["jobs"]
 
     for name, arch, preflight in (
-        ("prepare", "x86_64", True),
+        ("prepare", "x86_64", False),
         ("package-candidate", "x86_64", False),
     ):
         setup = _delegated_setup_step(jobs[name])
@@ -1298,6 +1281,7 @@ def test_every_native_job_delegates_setup_and_keeps_checkout_in_the_job():
     for name in ARCHITECTURE_JOBS:
         setup = _delegated_setup_step(round_jobs[name])
         assert setup["with"]["preflight"] == "true"
+        assert setup["with"]["tool-cache-root"] == "/opt/oe-image-tools"
     decide_setup = _delegated_setup_step(round_jobs["decide"])
     assert decide_setup["with"]["arch"] == "x86_64"
 

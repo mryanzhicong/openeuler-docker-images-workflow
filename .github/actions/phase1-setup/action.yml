@@ -14,6 +14,12 @@ inputs:
     description: "Enforce the native runner preflight check"
     required: false
     default: "false"
+  tool-cache-root:
+    description: >-
+      Writable root for locked tools. Native runners use their persistent
+      /opt cache; hosted control jobs default to a job-local cache.
+    required: false
+    default: ""
 
 outputs:
   dgoss_path:
@@ -49,9 +55,14 @@ runs:
       shell: bash
       env:
         ARCH: ${{ inputs.arch }}
+        REQUESTED_TOOL_CACHE_ROOT: ${{ inputs.tool-cache-root }}
       run: |
+        tool_cache_root="${REQUESTED_TOOL_CACHE_ROOT}"
+        if [ -z "${tool_cache_root}" ]; then
+          tool_cache_root="${RUNNER_TEMP}/oe-image-tools"
+        fi
         "${RUNNER_TEMP}/phase1-venv/bin/python" scripts/bootstrap_tools.py \
-          --cache-root /opt/oe-image-tools \
+          --cache-root "${tool_cache_root}" \
           --arch "${ARCH}" \
           --output-json "${RUNNER_TEMP}/toolchain.json" \
           --github-output "${GITHUB_OUTPUT}"

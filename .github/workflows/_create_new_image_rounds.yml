@@ -66,12 +66,26 @@ jobs:
       - name: Check out workflow source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      - name: Clean native runner before validation (x86_64)
+        run: |
+          python3 scripts/runner_cleanup.py \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --job-temp "${RUNNER_TEMP}" \
+            --architecture x86_64 \
+            --phase before \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --round "${{ inputs.round }}" \
+            --runner-name "${{ runner.name }}" \
+            --report "${RUNNER_TEMP}/phase1-round/cleanup-before-x86_64.json"
+
       - name: Set up tooling
         id: tools
         uses: ./.github/actions/phase1-setup
         with:
           arch: x86_64
           preflight: "true"
+          tool-cache-root: /opt/oe-image-tools
 
       - name: Download round candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -125,6 +139,20 @@ jobs:
             --junit "${RUNNER_TEMP}/phase1-round/x86_64.junit.xml" \
             --repair-report-dir "${RUNNER_TEMP}/phase1-round/smoke-agents"
 
+      - name: Clean native runner after validation (x86_64)
+        if: ${{ always() }}
+        run: |
+          python3 scripts/runner_cleanup.py \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --job-temp "${RUNNER_TEMP}" \
+            --architecture x86_64 \
+            --phase after \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --round "${{ inputs.round }}" \
+            --runner-name "${{ runner.name }}" \
+            --report "${RUNNER_TEMP}/phase1-round/cleanup-after-x86_64.json"
+
       - name: Upload round evidence (x86_64)
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -142,12 +170,26 @@ jobs:
       - name: Check out workflow source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      - name: Clean native runner before validation (aarch64)
+        run: |
+          python3 scripts/runner_cleanup.py \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --job-temp "${RUNNER_TEMP}" \
+            --architecture aarch64 \
+            --phase before \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --round "${{ inputs.round }}" \
+            --runner-name "${{ runner.name }}" \
+            --report "${RUNNER_TEMP}/phase1-round/cleanup-before-aarch64.json"
+
       - name: Set up tooling
         id: tools
         uses: ./.github/actions/phase1-setup
         with:
           arch: aarch64
           preflight: "true"
+          tool-cache-root: /opt/oe-image-tools
 
       - name: Download round candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -201,6 +243,20 @@ jobs:
             --junit "${RUNNER_TEMP}/phase1-round/aarch64.junit.xml" \
             --repair-report-dir "${RUNNER_TEMP}/phase1-round/smoke-agents"
 
+      - name: Clean native runner after validation (aarch64)
+        if: ${{ always() }}
+        run: |
+          python3 scripts/runner_cleanup.py \
+            --workspace "${GITHUB_WORKSPACE}" \
+            --job-temp "${RUNNER_TEMP}" \
+            --architecture aarch64 \
+            --phase after \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}" \
+            --round "${{ inputs.round }}" \
+            --runner-name "${{ runner.name }}" \
+            --report "${RUNNER_TEMP}/phase1-round/cleanup-after-aarch64.json"
+
       - name: Upload round evidence (aarch64)
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -214,7 +270,7 @@ jobs:
     name: Decide round outcome
     needs: [x86_64, aarch64]
     if: ${{ always() }}
-    runs-on: [self-hosted, Linux, X64, oe-image-x86]
+    runs-on: ubuntu-latest
     timeout-minutes: 180
     outputs:
       converged: ${{ steps.judge.outputs.converged }}
@@ -253,6 +309,40 @@ jobs:
         with:
           name: phase1-round${{ inputs.round }}-aarch64-${{ github.run_id }}
           path: ${{ runner.temp }}/phase1-arm
+
+      - name: Verify native runner cleanup evidence
+        run: |
+          mkdir -p "${RUNNER_TEMP}/phase1-decide"
+          status=0
+          for specification in \
+            "${RUNNER_TEMP}/phase1-x86/cleanup-before-x86_64.json:before:x86_64" \
+            "${RUNNER_TEMP}/phase1-x86/cleanup-after-x86_64.json:after:x86_64" \
+            "${RUNNER_TEMP}/phase1-arm/cleanup-before-aarch64.json:before:aarch64" \
+            "${RUNNER_TEMP}/phase1-arm/cleanup-after-aarch64.json:after:aarch64"
+          do
+            report="${specification%%:*}"
+            remainder="${specification#*:}"
+            phase="${remainder%%:*}"
+            architecture="${remainder#*:}"
+            "${{ steps.tools.outputs.jq_path }}" -e \
+              --arg phase "${phase}" \
+              --arg architecture "${architecture}" \
+              --arg run_id "${{ github.run_id }}" \
+              --arg run_attempt "${{ github.run_attempt }}" \
+              --arg round "${{ inputs.round }}" \
+              '.status == "passed" and .phase == $phase and
+               .architecture == $architecture and .run_id == $run_id and
+               .run_attempt == $run_attempt and .round == $round and
+               (.runner_name | type) == "string" and
+               (.runner_name | length) > 0' \
+              "${report}" > /dev/null || status=1
+          done
+          if [ "${status}" -ne 0 ]; then
+            printf '%s\n' \
+              '{"status":"error","error":"native runner cleanup failed"}' \
+              > "${RUNNER_TEMP}/phase1-decide/cleanup-error.json"
+            exit 2
+          fi
 
       - name: Replay round candidate
         uses: ./.github/actions/phase1-replay
