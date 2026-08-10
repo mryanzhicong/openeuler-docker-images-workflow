@@ -99,6 +99,7 @@ jobs:
         id: tools
         uses: ./.github/actions/phase1-setup
         with:
+          python-version: "3.11"
           arch: x86_64
 
       - name: Normalize TaskSpec
@@ -628,6 +629,7 @@ jobs:
         id: tools
         uses: ./.github/actions/phase1-setup
         with:
+          python-version: "3.11"
           arch: x86_64
 
       - name: Download generation evidence
@@ -1083,6 +1085,8 @@ jobs:
 
       - name: Set up tooling
         uses: ./.github/actions/phase1-setup
+        with:
+          python-version: "3.11"
 
       - name: Download validated candidate
         if: ${{ inputs.operation != 'fork_pr_resume' }}
@@ -1252,6 +1256,8 @@ jobs:
 
       - name: Set up tooling
         uses: ./.github/actions/phase1-setup
+        with:
+          python-version: "3.11"
 
       - name: Normalize TaskSpec
         env:

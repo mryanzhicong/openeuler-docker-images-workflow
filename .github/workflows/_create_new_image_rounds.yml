@@ -283,6 +283,7 @@ jobs:
         id: tools
         uses: ./.github/actions/phase1-setup
         with:
+          python-version: "3.11"
           arch: x86_64
 
       - name: Apply existing-as-new context

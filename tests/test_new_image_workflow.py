@@ -990,8 +990,14 @@ def test_actions_are_commit_pinned_and_python_install_requires_hashes():
     )
 
     setup = _action_text("phase1-setup")
+    setup_action = _action("phase1-setup")
+    assert setup_action["inputs"]["python-version"]["default"] == ""
     assert "--require-hashes" in setup
     assert ".github/python-phase1.lock.txt" in setup
+    assert (
+        "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+        in setup
+    )
 
 
 def test_legacy_evidence_is_allowed_only_on_the_reviewed_recovery_path():
@@ -1274,20 +1280,23 @@ def test_control_and_native_jobs_delegate_their_setup_modes():
     ):
         setup = _delegated_setup_step(jobs[name])
         assert setup["id"] == "tools"
+        assert setup["with"]["python-version"] == "3.11"
         assert setup["with"]["arch"] == arch
         assert setup["with"].get("preflight", "false") == str(preflight).lower()
 
     round_jobs = _workflow(ROUND_PATH)["jobs"]
     for name in ARCHITECTURE_JOBS:
         setup = _delegated_setup_step(round_jobs[name])
+        assert "python-version" not in setup["with"]
         assert setup["with"]["preflight"] == "true"
         assert setup["with"]["tool-cache-root"] == "/opt/oe-image-tools"
     decide_setup = _delegated_setup_step(round_jobs["decide"])
+    assert decide_setup["with"]["python-version"] == "3.11"
     assert decide_setup["with"]["arch"] == "x86_64"
 
     for name in ("deliver-fork-pr", "issue-contract-test"):
         setup = _delegated_setup_step(jobs[name])
-        assert "with" not in setup
+        assert setup["with"]["python-version"] == "3.11"
 
 
 

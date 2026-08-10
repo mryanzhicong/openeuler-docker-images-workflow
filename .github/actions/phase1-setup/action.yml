@@ -4,6 +4,12 @@ description: >-
   toolchain, and enforce the native runner preflight.
 
 inputs:
+  python-version:
+    description: >-
+      Exact Python version for GitHub-hosted control jobs. Leave empty on
+      native self-hosted runners to use their preinstalled Python.
+    required: false
+    default: ""
   arch:
     description: >-
       Native architecture whose locked toolchain is bootstrapped.
@@ -41,6 +47,12 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Set up pinned Python
+      if: ${{ inputs.python-version != '' }}
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: ${{ inputs.python-version }}
+
     - name: Create locked Python environment
       shell: bash
       run: |
