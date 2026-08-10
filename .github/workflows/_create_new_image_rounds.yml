@@ -85,7 +85,6 @@ jobs:
         with:
           arch: x86_64
           preflight: "true"
-          tool-cache-root: /opt/oe-image-tools
 
       - name: Download round candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -189,7 +188,6 @@ jobs:
         with:
           arch: aarch64
           preflight: "true"
-          tool-cache-root: /opt/oe-image-tools
 
       - name: Download round candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093

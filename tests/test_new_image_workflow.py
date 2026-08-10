@@ -994,6 +994,8 @@ def test_actions_are_commit_pinned_and_python_install_requires_hashes():
     assert setup_action["inputs"]["python-version"]["default"] == ""
     assert "--require-hashes" in setup
     assert ".github/python-phase1.lock.txt" in setup
+    assert '${HOME}/.cache/oe-image-tools' in setup
+    assert '${RUNNER_TEMP}/oe-image-tools' in setup
     assert (
         "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
         in setup
@@ -1289,7 +1291,7 @@ def test_control_and_native_jobs_delegate_their_setup_modes():
         setup = _delegated_setup_step(round_jobs[name])
         assert "python-version" not in setup["with"]
         assert setup["with"]["preflight"] == "true"
-        assert setup["with"]["tool-cache-root"] == "/opt/oe-image-tools"
+        assert "tool-cache-root" not in setup["with"]
     decide_setup = _delegated_setup_step(round_jobs["decide"])
     assert decide_setup["with"]["python-version"] == "3.11"
     assert decide_setup["with"]["arch"] == "x86_64"

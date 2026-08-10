@@ -22,8 +22,8 @@ inputs:
     default: "false"
   tool-cache-root:
     description: >-
-      Writable root for locked tools. Native runners use their persistent
-      /opt cache; hosted control jobs default to a job-local cache.
+      Optional writable root for locked tools. Native runners default to a
+      persistent cache under HOME; hosted control jobs use a job-local cache.
     required: false
     default: ""
 
@@ -67,11 +67,20 @@ runs:
       shell: bash
       env:
         ARCH: ${{ inputs.arch }}
+        PREFLIGHT: ${{ inputs.preflight }}
         REQUESTED_TOOL_CACHE_ROOT: ${{ inputs.tool-cache-root }}
       run: |
         tool_cache_root="${REQUESTED_TOOL_CACHE_ROOT}"
         if [ -z "${tool_cache_root}" ]; then
-          tool_cache_root="${RUNNER_TEMP}/oe-image-tools"
+          if [ "${PREFLIGHT}" = "true" ]; then
+            if [ -z "${HOME}" ] || [ "${HOME}" = "/" ]; then
+              echo "HOME must identify the native runner user's home" >&2
+              exit 2
+            fi
+            tool_cache_root="${HOME}/.cache/oe-image-tools"
+          else
+            tool_cache_root="${RUNNER_TEMP}/oe-image-tools"
+          fi
         fi
         "${RUNNER_TEMP}/phase1-venv/bin/python" scripts/bootstrap_tools.py \
           --cache-root "${tool_cache_root}" \
